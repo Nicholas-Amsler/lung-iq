@@ -182,73 +182,59 @@ export default function Home() {
 
   // ─── KONAMI CODE LISTENER ──────────────────────────────────────────────────
   useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      // Ignore if user is typing in an input field
-      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) {
-        return;
+  const handleKeyDown = (event: KeyboardEvent) => {
+    // Ignore if user is typing in an input field
+    if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) {
+      return;
+    }
+
+    setKonamiSequence(prev => {
+      const newSequence = [...prev, event.code];
+      
+      // Keep only the last 10 key presses (length of Konami code)
+      if (newSequence.length > KONAMI_CODE.length) {
+        newSequence.shift();
       }
+      
+      // Check if the sequence matches the Konami code
+      if (newSequence.length === KONAMI_CODE.length) {
+        const matches = KONAMI_CODE.every((code, index) => code === newSequence[index]);
+        
+        if (matches && !konamiUnlocked) {
+          setKonamiUnlocked(true);
+          setShowKonamiMessage(true);
 
-      setKonamiSequence(prev => {
-        const newSequence = [...prev, event.code];
-        
-        // Keep only the last 10 key presses (length of Konami code)
-        if (newSequence.length > KONAMI_CODE.length) {
-          newSequence.shift();
-        }
-        
-        // Check if the sequence matches the Konami code
-        if (newSequence.length === KONAMI_CODE.length) {
-          const matches = KONAMI_CODE.every((code, index) => code === newSequence[index]);
-          
-          if (matches && !konamiUnlocked) {
-            setKonamiUnlocked(true);
-            setShowKonamiMessage(true);
-            
-            // Get all scenario IDs from all learning paths
-            const allScenarioIds: string[] = [];
-            LEARNING_PATHS.forEach(path => {
-              path.scenarios.forEach(scenario => {
-                allScenarioIds.push(scenario.id);
-              });
-            });
-            
-            // Unlock all scenarios
-            setCompletedScenarios(allScenarioIds);
-            
-            // Hide the message after specified time (currently 3 seconds)
-            // CUSTOMIZE DURATION HERE: Change 3000 to any milliseconds value
-            setTimeout(() => setShowKonamiMessage(false), 5000); // 5 seconds
-            
-            // Clear the sequence
-            return [];
-          }
-        }
-        
-        return newSequence;
-      });
-    };
+          // ✅ Save developer mode flag only
+          localStorage.setItem('lungIQ-konami', 'unlocked');
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [konamiUnlocked]);
+          // Hide the message after specified time
+          setTimeout(() => setShowKonamiMessage(false), 5000);
+
+          // Clear the sequence
+          return [];
+        }
+      }
+      
+      return newSequence;
+    });
+  };
+
+  window.addEventListener('keydown', handleKeyDown);
+  return () => window.removeEventListener('keydown', handleKeyDown);
+}, [konamiUnlocked]);
+
 
   // Load Konami unlock status from localStorage
-  useEffect(() => {
-    if (typeof window !== 'undefined') {
-      const konamiStatus = localStorage.getItem('lungIQ-konami');
-      if (konamiStatus === 'unlocked') {
-        setKonamiUnlocked(true);
-        // Get all scenario IDs and unlock them
-        const allScenarioIds: string[] = [];
-        LEARNING_PATHS.forEach(path => {
-          path.scenarios.forEach(scenario => {
-            allScenarioIds.push(scenario.id);
-          });
-        });
-        setCompletedScenarios(allScenarioIds);
-      }
+useEffect(() => {
+  if (typeof window !== 'undefined') {
+    const konamiStatus = localStorage.getItem('lungIQ-konami');
+    if (konamiStatus === 'unlocked') {
+      setKonamiUnlocked(true);
+      // ✅ Do NOT auto-complete scenarios
+      // Users can still manually complete each scenario
     }
-  }, []);
+  }
+}, []);
 
   // Save Konami unlock status to localStorage
   useEffect(() => {
@@ -1508,6 +1494,10 @@ export default function Home() {
           }}
         />
       )}
+     {/* ✅ WATERMARK OVERLAY */}
+      <div className="fixed bottom-2 right-2 text-white text-xs opacity-30 pointer-events-none z-50">
+        © 2025 Amsler Labs | LungIQ
+      </div>
     </div>
   );
 }
