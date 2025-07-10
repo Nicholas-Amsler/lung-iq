@@ -58,6 +58,8 @@ export default function Home() {
   const [patientType, setPatientType] = useState<string>('adult');
   const [patientWeight, setPatientWeight] = useState<number>(70); // kg
   const [patientAge, setPatientAge] = useState<number>(30); // years
+  const [patientHeight, setPatientHeight] = useState<number>(170); // cm
+  const [patientGender, setPatientGender] = useState<string>('male'); // for IBW calculation
 
   // ─── 2. HIGH/LOW PRESSURE ALARM THRESHOLDS ─────────────────────────────────
   const [highPressLimit, setHighPressLimit] = useState<number>(35);
@@ -111,6 +113,65 @@ export default function Home() {
 
   // ─── HELPER FUNCTIONS ──────────────────────────────────────────────────────
 
+  // Get compliance values based on condition and patient type (from 2024 literature)
+  const getCompliance = (condition: string, patientType: string): number => {
+    // Adult values from 2024 studies
+    if (patientType === 'adult') {
+      switch (condition) {
+        case 'ards': return 40; // 35-45 mL/cmH₂O range
+        case 'copd': return 59; // Higher compliance
+        case 'asthma': return 55; // Near normal compliance
+        case 'pneumothorax': return 30; // Severely reduced
+        case 'normal': return 54; // Normal adult compliance
+        default: return 50;
+      }
+    }
+    
+    // Pediatric values adjusted for size
+    const scaleFactor = Math.min(weight / 70, 1); // Scale based on weight
+    const baseCompliance = getCompliance(condition, 'adult');
+    return Math.round(baseCompliance * scaleFactor * 0.8); // Pediatric adjustment
+  };
+
+  // Get resistance values based on condition (from 2024 literature)
+  const getResistance = (condition: string): number => {
+    switch (condition) {
+      case 'ards': return 12; // 10-15 cmH₂O/L/s (using lower end)
+      case 'copd': return 22; // 10-25 cmH₂O/L/s (moderate COPD)
+      case 'asthma': return 25; // High during exacerbation
+      case 'pneumothorax': return 8; // May be normal or slightly elevated
+      case 'normal': return 7; // 4-10 cmH₂O/L/s (mid-range normal)
+      default: return 7;
+    }
+  };
+
+  // Get expiratory time constant (from 2024 data)
+  const getTimeConstant = (condition: string): number => {
+    switch (condition) {
+      case 'normal': return 0.60;
+      case 'copd': return 1.07; // Prolonged expiration
+      case 'asthma': return 0.90; // Prolonged expiration
+      case 'ards': return 0.46; // Rapid due to low compliance
+      case 'pneumothorax': return 0.40; // Very rapid
+      default: return 0.60;
+    }
+  };
+
+  // Calculate Ideal Body Weight (IBW) using ARDSnet formulas
+  const calculateIBW = (heightCm: number, gender: string): number => {
+    // Convert height from cm to inches
+    const heightInches = heightCm / 2.54;
+    
+    // ARDSnet formulas
+    if (gender === 'male') {
+      // Male: IBW = 50 + 2.3 × (height in inches - 60)
+      return Math.max(50, 50 + 2.3 * (heightInches - 60));
+    } else {
+      // Female: IBW = 45.5 + 2.3 × (height in inches - 60)
+      return Math.max(45.5, 45.5 + 2.3 * (heightInches - 60));
+    }
+  };
+
   // Get recommended parameter ranges based on patient type
   const getParameterRanges = (patientType: string, weight: number) => {
     const category = PEDIATRIC_CATEGORIES[patientType as keyof typeof PEDIATRIC_CATEGORIES];
@@ -121,7 +182,7 @@ export default function Home() {
         pipRange: [15, 50],
         rrRange: [8, 30],
         tvRange: [400, 800],
-        ieRange: [0.2, 3.0]
+        ieRange: [0.25, 3.0]  // Extended to 0.25 for 1:4 reverse ratio
       };
     }
     
@@ -134,25 +195,29 @@ export default function Home() {
                patientType === 'infant' ? [20, 40] :
                patientType === 'toddler' ? [20, 30] : [15, 25],
       tvRange: [Math.round(weight * category.tvPerKg[0]), Math.round(weight * category.tvPerKg[1])],
-      ieRange: [0.3, 2.0]
+      ieRange: [0.25, 2.0]  // Extended to 0.25 for 1:4 reverse ratio
     };
   };
 
-  // Calculate weight-based tidal volume for pediatrics
-  const calculateTidalVolume = (pip: number, peep: number, patientType: string, weight: number) => {
+  // Calculate tidal volume using proper compliance equation (2024 evidence-based)
+  const calculateTidalVolume = (pip: number, peep: number, patientType: string, weight: number, condition: string) => {
+    // Use compliance-based calculation: TV = Compliance × (PIP - PEEP)
+    const compliance = getCompliance(condition, patientType);
+    const drivingPressure = pip - peep;
+    const calculatedTV = Math.round(compliance * drivingPressure);
+    
+    // Apply safety limits based on lung-protective ventilation guidelines
     if (patientType === 'adult') {
-      // Keep your existing adult calculation
-      return Math.round(((pip - peep) * 18) / 10) * 10;
+      // ARDSnet: 4-8 mL/kg predicted body weight (IBW)
+      const ibw = calculateIBW(patientHeight, patientGender);
+      const minTV = Math.round(ibw * 4);
+      const maxTV = Math.round(ibw * 8);
+      return Math.max(minTV, Math.min(maxTV, calculatedTV));
     } else {
-      // Pediatric calculation based on weight
+      // Pediatric: 4-6 mL/kg actual body weight (2024 guidelines)
       const category = PEDIATRIC_CATEGORIES[patientType as keyof typeof PEDIATRIC_CATEGORIES];
-      const baseTV = weight * 6; // 6 mL/kg as baseline
-      const pressureAdjustment = (pip - peep) * 0.5; // Smaller adjustment factor for peds
-      const calculatedTV = Math.round((baseTV + pressureAdjustment) / 5) * 5; // Round to nearest 5mL
-      
-      // Ensure it stays within safe ranges
-      const minTV = weight * category.tvPerKg[0];
-      const maxTV = weight * category.tvPerKg[1];
+      const minTV = Math.round(weight * category.tvPerKg[0]);
+      const maxTV = Math.round(weight * category.tvPerKg[1]);
       return Math.max(minTV, Math.min(maxTV, calculatedTV));
     }
   };
@@ -350,79 +415,180 @@ useEffect(() => {
     condition = 'normal',
     riseTime = 0.3,
     mode = 'volume',
-    breathStep = 0
+    breathStep = 0,
+    patientType = 'adult',
+    patientWeight = 70
   ) => {
     const breathLength = 100;
     const cycle = Array.from({ length: breathLength }, (_, i) => i);
     const inspTime = breathLength * (ieRatio / (1 + ieRatio));
     let y: number[];
 
-    let resistanceFactor = 1;
-    let complianceFactor = 1;
-    switch (condition) {
-      case 'ards':
-        complianceFactor = 0.4;
-        break;
-      case 'copd':
-        resistanceFactor = 2;
-        break;
-      case 'asthma':
-        resistanceFactor = 3;
-        break;
-      case 'pneumothorax':
-        complianceFactor = 0.3;
-        break;
-    }
+    // Get actual compliance and resistance values from 2024 literature
+    const compliance = getCompliance(condition, 'adult'); // Will be scaled in TV calculation
+    const resistance = getResistance(condition);
+    const timeConstant = getTimeConstant(condition);
+    const normalCompliance = getCompliance('normal', 'adult');
+    const normalResistance = getResistance('normal');
+    
+    // Calculate factors for waveform generation
+    const complianceFactor = compliance / normalCompliance;
+    const resistanceFactor = resistance / normalResistance;
+    
     if (condition === 'weaning_failure' && breathStep >= 30) rr = 28;
 
     switch (type) {
       case 'pressure': {
         const riseTimeSteps = inspTime * riseTime;
+        
+        // Calculate auto-PEEP for reverse I:E ratios
+        let autoPEEPLevel = 0;
+        if (ieRatio < 0.5) {
+          // With reverse I:E, incomplete expiration causes auto-PEEP
+          const expTime = breathLength - inspTime;
+          const timeNeeded = timeConstant * 3;
+          const incompleteness = Math.max(0, 1 - (expTime / timeNeeded));
+          autoPEEPLevel = incompleteness * 3; // Up to 3 cmH2O auto-PEEP
+        }
+        
         y = cycle.map((i) => {
           if (mode === 'pressure' || mode === 'support') {
             if (i < riseTimeSteps) {
-              return peep + ((pip - peep) * (i / riseTimeSteps));
+              return (peep + autoPEEPLevel) + ((pip - peep) * (i / riseTimeSteps));
             }
             if (i < inspTime) {
-              return pip;
+              return pip + autoPEEPLevel;
             }
-            return peep;
+            // During expiration with reverse I:E, pressure doesn't fully return to set PEEP
+            if (ieRatio < 0.5) {
+              const expPhase = (i - inspTime) / (breathLength - inspTime);
+              const pressureDecay = (pip - peep) * Math.exp(-expPhase / (timeConstant * 0.3));
+              return peep + autoPEEPLevel + pressureDecay;
+            }
+            return peep + autoPEEPLevel;
           }
-          return peep + (pip - peep) * (i < inspTime ? i / inspTime : 0);
+          // Volume control mode
+          if (i < inspTime) {
+            return peep + autoPEEPLevel + (pip - peep) * (i / inspTime);
+          }
+          return peep + autoPEEPLevel;
         });
         break;
       }
       case 'flow': {
         const triggered = Math.random() < 0.1 && mode === 'support';
-        const flowRate = pip * 0.8 * complianceFactor;
+        // Realistic peak flow rates based on patient type and condition
+        let peakFlow = 30; // L/min baseline for adults
+        
+        // Adjust flow based on condition
+        switch (condition) {
+          case 'ards':
+            peakFlow = 20; // Lower flow due to poor compliance
+            break;
+          case 'copd':
+          case 'asthma':
+            peakFlow = 25; // Moderate flow, resistance issues
+            break;
+          case 'normal':
+          default:
+            peakFlow = 30; // Normal peak flow
+        }
+        
+        // Scale for pediatric patients
+        if (patientType !== 'adult') {
+          peakFlow = peakFlow * Math.min(patientWeight / 70, 1);
+        }
+        
+        const flowRate = peakFlow * complianceFactor;
+        
+        // Adjust flow rate for reverse I:E (higher flow needed for shorter insp time)
+        let adjustedFlowRate = flowRate;
+        if (ieRatio < 1) {
+          // Need higher flow to deliver same volume in shorter time
+          adjustedFlowRate = flowRate * (1 + (1 - ieRatio));
+        }
+        
         y = cycle.map((i) => {
-          if (triggered && i < inspTime / 2) return flowRate / 2;
-          if (i < inspTime) return flowRate;
+          if (triggered && i < inspTime / 2) return adjustedFlowRate / 2;
+          if (i < inspTime) {
+            // Inspiratory flow pattern depends on mode
+            if (mode === 'volume') {
+              return adjustedFlowRate; // Square wave for volume control
+            } else {
+              // Decelerating flow for pressure control
+              const inspProgress = i / inspTime;
+              return adjustedFlowRate * (1 - inspProgress * 0.5);
+            }
+          }
+          // Expiratory flow based on time constant
           const expPhase = (i - inspTime) / (breathLength - inspTime);
-          const decay = -flowRate * Math.exp(-3 * expPhase * resistanceFactor);
+          const expTime = breathLength - inspTime;
+          const timeNeeded = timeConstant * 3; // Need 3 time constants for 95% emptying
+          
+          // Calculate decay based on available time vs needed time
+          let decay;
+          if (ieRatio < 0.5) {
+            // Reverse I:E ratio - simulate incomplete expiration
+            const incompleteFactor = expTime / timeNeeded;
+            decay = -flowRate * Math.exp(-expPhase / (timeConstant * 0.5 * incompleteFactor));
+            // Don't let flow return to zero if insufficient time
+            if (expPhase > 0.8 && incompleteFactor < 0.5) {
+              const residualFlow = -flowRate * 0.1 * (1 - incompleteFactor);
+              return Math.min(decay, residualFlow);
+            }
+          } else {
+            // Normal expiration
+            decay = -flowRate * Math.exp(-expPhase / (timeConstant * 0.5));
+          }
+          
           return Math.abs(decay) < 0.5 ? 0 : decay;
         });
         break;
       }
       case 'volume': {
-        const flowData = generateClinicalWaveform(
-          'flow',
-          rr,
-          peep,
-          pip,
-          ieRatio,
-          phase,
-          condition,
-          riseTime,
-          mode,
-          breathStep
-        );
-        let cumVolume = 0;
-        const deltaT = (60 / rr) / breathLength;
-        y = flowData.y.map((flowValue) => {
-          cumVolume += flowValue * deltaT * 1000;
-          return cumVolume;
+        // Calculate patient-specific tidal volume based on mode and compliance
+        const patientCompliance = getCompliance(condition, patientType);
+        const drivingPressure = pip - peep;
+        let targetTidalVolume = Math.round(patientCompliance * drivingPressure);
+        
+        // Apply safety limits based on patient type
+        if (patientType === 'adult') {
+          const minTV = Math.round(patientWeight * 4);
+          const maxTV = Math.round(patientWeight * 8);
+          targetTidalVolume = Math.max(minTV, Math.min(maxTV, targetTidalVolume));
+        } else {
+          const category = PEDIATRIC_CATEGORIES[patientType as keyof typeof PEDIATRIC_CATEGORIES];
+          const minTV = Math.round(patientWeight * category.tvPerKg[0]);
+          const maxTV = Math.round(patientWeight * category.tvPerKg[1]);
+          targetTidalVolume = Math.max(minTV, Math.min(maxTV, targetTidalVolume));
+        }
+        
+        // Mode-specific volume waveforms
+        y = cycle.map((i) => {
+          if (i < inspTime) {
+            // Inspiration phase varies by mode
+            if (mode === 'volume') {
+              // Volume Control: Linear rise (constant flow)
+              return (targetTidalVolume * i) / inspTime;
+            } else if (mode === 'pressure' || mode === 'support') {
+              // Pressure modes: Exponential rise (decelerating flow)
+              const inspProgress = i / inspTime;
+              const riseConstant = 0.5; // Faster rise for pressure modes
+              return targetTidalVolume * (1 - Math.exp(-inspProgress / riseConstant));
+            } else {
+              // Default linear
+              return (targetTidalVolume * i) / inspTime;
+            }
+          } else {
+            // Expiration: Exponential decay based on time constant
+            const expPhase = (i - inspTime) / (breathLength - inspTime);
+            const expDecay = Math.exp(-expPhase / timeConstant);
+            return targetTidalVolume * expDecay;
+          }
         });
+        
+        // Ensure reasonable bounds to prevent display issues
+        y = y.map(vol => Math.max(0, Math.min(1000, vol)));
         break;
       }
       default:
@@ -486,9 +652,11 @@ useEffect(() => {
         condition,
         riseTime,
         mode,
-        breathStep
+        breathStep,
+        patientType,
+        patientWeight
       ),
-    [rr, peep, pip, ieRatio, phase, condition, riseTime, mode, breathStep]
+    [rr, peep, pip, ieRatio, phase, condition, riseTime, mode, breathStep, patientType, patientWeight]
   );
 
   const flow = useMemo(
@@ -503,26 +671,29 @@ useEffect(() => {
         condition,
         riseTime,
         mode,
-        breathStep
+        breathStep,
+        patientType,
+        patientWeight
       ),
-    [rr, peep, pip, ieRatio, phase, condition, riseTime, mode, breathStep]
+    [rr, peep, pip, ieRatio, phase, condition, riseTime, mode, breathStep, patientType, patientWeight]
   );
 
   const volume = useMemo(
-    () =>
-      generateClinicalWaveform(
-        'volume',
-        rr,
-        peep,
-        pip,
-        ieRatio,
-        phase,
-        condition,
-        riseTime,
-        mode,
-        breathStep
-      ),
-    [rr, peep, pip, ieRatio, phase, condition, riseTime, mode, breathStep]
+    () => generateClinicalWaveform(
+      'volume',
+      rr,
+      peep,
+      pip,
+      ieRatio,
+      phase,
+      condition,
+      riseTime,
+      mode,
+      breathStep,
+      patientType,
+      patientWeight
+    ),
+    [rr, peep, pip, ieRatio, phase, condition, riseTime, mode, breathStep, patientType, patientWeight]
   );
 
   const capnography = useMemo(
@@ -531,16 +702,39 @@ useEffect(() => {
   );
 
   // ─── DERIVED METRICS ───────────────────────────────────────────────────────
-  const tidalVolume = calculateTidalVolume(pip, peep, patientType, patientWeight);
+  const tidalVolume = calculateTidalVolume(pip, peep, patientType, patientWeight, condition);
   const minuteVent = ((tidalVolume * rr) / 1000).toFixed(2);
   const plateau = pip - 2;
+  
+  // Calculate compliance values for display
+  const dynamicCompliance = pip > peep ? Math.round(tidalVolume / (pip - peep)) : 0;
+  const staticCompliance = getCompliance(condition, patientType);
+  const drivingPressure = pip - peep;
 
   // Get current parameter ranges
   const parameterRanges = getParameterRanges(patientType, patientWeight);
 
+  // Calculate IBW for adults (only applicable for adults)
+  const idealBodyWeight = patientType === 'adult' ? calculateIBW(patientHeight, patientGender) : null;
+
   // ─── AUTO-PEEP DETECTION & ANIMATION ──────────────────────────────────────
-  const endFlowSegment = flow.y.slice(-5);
-  const autoPEEP = endFlowSegment.every((v) => v > 2);
+  // Improved auto-PEEP detection based on time constant and I:E ratio
+  const endFlowSegment = flow.y.slice(-10);
+  const avgEndFlow = endFlowSegment.reduce((a, b) => a + b, 0) / endFlowSegment.length;
+  const timeConstant = getTimeConstant(condition);
+  const breathTime = 60 / rr;
+  const expTime = breathTime * (1 / (1 + ieRatio));
+  const minExpTime = timeConstant * 3; // Need 3 time constants for 95% emptying
+  
+  // Auto-PEEP present if flow doesn't return to zero, insufficient expiratory time, or reverse I:E
+  const autoPEEP = Math.abs(avgEndFlow) > 2 || expTime < minExpTime || ieRatio < 0.5;
+  
+  // Calculate estimated auto-PEEP level for display
+  const autoPEEPLevel = autoPEEP ? (
+    ieRatio < 0.5 ? 
+      Math.round(3 * (1 - ieRatio * 2)) : // Up to 3 cmH2O for reverse I:E
+      Math.round(2 * (1 - expTime / minExpTime)) // Up to 2 cmH2O for insufficient time
+  ) : 0;
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -643,13 +837,23 @@ useEffect(() => {
   });
 
   // ─── PLOT DATA HELPER ──────────────────────────────────────────────────────
-  const createPlotData = (x: number[], y: number[], color: string, width = 2) => [{
-    x,
-    y,
-    type: 'scatter' as const,
-    mode: 'lines' as const,
-    line: { color, width }
-  }];
+  const createPlotData = (x: number[], y: number[], color: string, width = 2) => {
+    // Validate y data to prevent extreme values
+    const cleanY = y.map(val => {
+      if (isNaN(val) || val > 10000) {
+        return 0;
+      }
+      return val;
+    });
+    
+    return [{
+      x,
+      y: cleanY,
+      type: 'scatter' as const,
+      mode: 'lines' as const,
+      line: { color, width }
+    }];
+  };
 
   const plotConfig = {
     displayModeBar: !isMobile,
@@ -706,6 +910,7 @@ useEffect(() => {
         isCorrect: null,
         scenarioId: scenario.id,
         hint: scenario.quiz.hint,
+        reference: scenario.quiz.reference,
       });
     }
 
@@ -763,8 +968,9 @@ useEffect(() => {
   // ─── STYLING CLASSES ──────────────────────────────────────────────────────
   const bgColorClass = isDark ? 'bg-black text-white' : 'bg-white text-black';
   const sectionBg = isDark ? 'bg-[#0f172a]' : 'bg-[#e2e8f0]';
-  const labelText = isDark ? 'text-white' : 'text-black';
-  const valueText = isDark ? 'text-green-300' : 'text-green-700';
+  const labelText = isDark ? 'text-white text-lg' : 'text-black text-lg';
+  const valueText = isDark ? 'text-green-300 text-xl' : 'text-green-700 text-xl';
+  const smallText = isDark ? 'text-white text-base' : 'text-black text-base';
   const inputBg = isDark
     ? 'bg-gray-800 text-white border-gray-600'
     : 'bg-white text-black border-gray-300';
@@ -902,6 +1108,41 @@ useEffect(() => {
                     className={`w-full h-8 ${isMobile ? 'h-12' : ''} appearance-none bg-gray-300 rounded-lg cursor-pointer`}
                   />
                 </div>
+
+                {/* Height Input (for adults only - needed for IBW calculation) */}
+                {patientType === 'adult' && (
+                  <div>
+                    <label className={`block ${labelText} font-medium mb-2`}>
+                      Height: <span className={`${valueText} font-semibold`}>{patientHeight} cm</span>
+                    </label>
+                    <input
+                      type="range"
+                      min="140"
+                      max="220"
+                      step="1"
+                      value={patientHeight}
+                      onChange={(e) => setPatientHeight(Number(e.target.value))}
+                      className={`w-full h-8 ${isMobile ? 'h-12' : ''} appearance-none bg-gray-300 rounded-lg cursor-pointer`}
+                    />
+                  </div>
+                )}
+
+                {/* Gender Selection (for adults only - needed for IBW calculation) */}
+                {patientType === 'adult' && (
+                  <div>
+                    <label className={`block ${labelText} font-medium mb-2`}>
+                      Gender: <span className={`${valueText} font-semibold`}>{patientGender === 'male' ? 'Male' : 'Female'}</span>
+                    </label>
+                    <select
+                      value={patientGender}
+                      onChange={(e) => setPatientGender(e.target.value)}
+                      className={`w-full h-8 ${isMobile ? 'h-12' : ''} ${inputBg} rounded cursor-pointer`}
+                    >
+                      <option value="male">Male</option>
+                      <option value="female">Female</option>
+                    </select>
+                  </div>
+                )}
               </div>
 
               {/* Parameter Recommendations */}
@@ -925,7 +1166,7 @@ useEffect(() => {
               <div className="space-y-2" id="peep-slider">
                 <div className="flex justify-between items-center">
                   <span className={`${labelText} font-medium`}>PEEP:</span>
-                  <span className={`${valueText} font-semibold text-lg`}>{peep} cmH₂O</span>
+                  <span className={`${valueText} font-semibold`}>{peep} cmH₂O</span>
                 </div>
                 <input
                   type="range"
@@ -941,7 +1182,7 @@ useEffect(() => {
               <div className="space-y-2" id="pip-slider">
                 <div className="flex justify-between items-center">
                   <span className={`${labelText} font-medium`}>PIP:</span>
-                  <span className={`${valueText} font-semibold text-lg`}>{pip} cmH₂O</span>
+                  <span className={`${valueText} font-semibold`}>{pip} cmH₂O</span>
                 </div>
                 <input
                   type="range"
@@ -957,7 +1198,7 @@ useEffect(() => {
               <div className="space-y-2">
                 <div className="flex justify-between items-center">
                   <span className={`${labelText} font-medium`}>Respiratory Rate:</span>
-                  <span className={`${valueText} font-semibold text-lg`}>{rr} bpm</span>
+                  <span className={`${valueText} font-semibold`}>{rr} bpm</span>
                 </div>
                 <input
                   type="range"
@@ -973,24 +1214,32 @@ useEffect(() => {
               <div className="space-y-2" id="ie-slider">
                 <div className="flex justify-between items-center">
                   <span className={`${labelText} font-medium`}>I:E Ratio:</span>
-                  <span className={`${valueText} font-semibold text-lg`}>{ieRatio}:1</span>
+                  <span className={`${valueText} font-semibold`}>
+                    {ieRatio >= 1 ? `${ieRatio.toFixed(1)}:1` : `1:${(1/ieRatio).toFixed(1)}`}
+                    {ieRatio < 0.5 && <span className="text-sm text-orange-400 ml-1">(Reverse)</span>}
+                  </span>
                 </div>
                 <input
                   type="range"
-                  min="0.2"
+                  min="0.25"
                   max="3"
-                  step="0.1"
+                  step="0.05"
                   value={ieRatio}
                   onChange={(e) => setIERatio(Number(e.target.value))}
                   className={`w-full h-8 ${isMobile ? 'h-12' : ''} appearance-none bg-gray-300 rounded-lg cursor-pointer`}
                 />
+                {ieRatio < 0.5 && (
+                  <p className="text-sm text-orange-400 mt-1">
+                    ⚠️ Inverse I:E ratio - Used for oxygenation in severe ARDS, causes air trapping
+                  </p>
+                )}
               </div>
 
               {/* EtCO₂ Slider */}
               <div className="space-y-2">
                 <div className="flex justify-between items-center">
                   <span className={`${labelText} font-medium`}>EtCO₂ Max:</span>
-                  <span className={`${valueText} font-semibold text-lg`}>{etco2Max} mmHg</span>
+                  <span className={`${valueText} font-semibold`}>{etco2Max} mmHg</span>
                 </div>
                 <input
                   type="range"
@@ -1051,7 +1300,7 @@ useEffect(() => {
             {/* Metrics Display */}
             <div className={`mt-6 p-4 ${sectionBg} rounded`}>
               <h3 className={`font-semibold mb-3 ${labelText}`}>Current Metrics</h3>
-              <div className={`${isMobile ? 'space-y-2' : 'grid grid-cols-2 md:grid-cols-4 gap-4'} text-sm`}>
+              <div className={`${isMobile ? 'space-y-2' : 'grid grid-cols-2 md:grid-cols-3 gap-4'} text-base`}>
                 <div>
                   <span className={`${labelText}`}>Tidal Volume: </span>
                   <span className={`${valueText} font-semibold`}>
@@ -1067,18 +1316,52 @@ useEffect(() => {
                   <span className={`${labelText}`}>Plateau: </span>
                   <span className={`${valueText} font-semibold`}>{plateau} cmH₂O</span>
                 </div>
-                {patientType === 'adult' && (
+                <div>
+                  <span className={`${labelText}`}>Driving Pressure: </span>
+                  <span className={`${valueText} font-semibold ${drivingPressure > 15 ? 'text-red-400' : ''}`}>
+                    {drivingPressure} cmH₂O {drivingPressure > 15 && '⚠️'}
+                  </span>
+                </div>
+                <div>
+                  <span className={`${labelText}`}>Dynamic C: </span>
+                  <span className={`${valueText} font-semibold`}>{dynamicCompliance} mL/cmH₂O</span>
+                </div>
+                <div>
+                  <span className={`${labelText}`}>Static C: </span>
+                  <span className={`${valueText} font-semibold`}>{staticCompliance} mL/cmH₂O</span>
+                </div>
+                <div>
+                  <span className={`${labelText}`}>Auto-PEEP: </span>
+                  <span className={`${valueText} font-semibold ${autoPEEPLevel > 0 ? 'text-orange-400' : ''}`}>
+                    {autoPEEPLevel} cmH₂O {autoPEEPLevel > 0 && '⚠️'}
+                  </span>
+                </div>
+                {patientType === 'adult' && idealBodyWeight && (
                   <div>
                     <span className={`${labelText}`}>IBW TV Target: </span>
                     <span className={`${valueText} font-semibold`}>
-                      {Math.round(patientWeight * 6)}-{Math.round(patientWeight * 8)} mL
+                      {Math.round(idealBodyWeight * 6)}-{Math.round(idealBodyWeight * 8)} mL
+                    </span>
+                  </div>
+                )}
+                {patientType === 'adult' && idealBodyWeight && (
+                  <div>
+                    <span className={`${labelText}`}>IBW: </span>
+                    <span className={`${valueText} font-semibold`}>
+                      {Math.round(idealBodyWeight)} kg
                     </span>
                   </div>
                 )}
               </div>
               {autoPEEP && (
-                <div className="mt-3 p-2 bg-red-600 text-white rounded text-sm">
-                  ⚠️ Auto-PEEP suspected: Expiratory flow not returning to zero
+                <div className="mt-3 p-2 bg-red-600 text-white rounded text-base">
+                  ⚠️ Auto-PEEP suspected: {
+                    ieRatio < 0.5 ? 
+                      `Reverse I:E ratio (${ieRatio >= 1 ? `${ieRatio.toFixed(1)}:1` : `1:${(1/ieRatio).toFixed(1)}`}) causing air trapping` :
+                    Math.abs(avgEndFlow) > 2 ? 
+                      'Expiratory flow not returning to zero' : 
+                      `Insufficient expiratory time (need ${minExpTime.toFixed(1)}s, have ${expTime.toFixed(1)}s)`
+                  }
                 </div>
               )}
             </div>
@@ -1119,11 +1402,24 @@ useEffect(() => {
               <div className={`${sectionBg} rounded p-2`}>
                 <Plot
                   data={createPlotData(volume.x, volume.y, isDark ? 'cyan' : 'teal', isMobile ? 3 : 2)}
-                  layout={mobileOptimizedLayout('Volume (mL)', 'mL')}
+                  layout={{
+                    ...mobileOptimizedLayout('Volume (mL)', 'mL'),
+                    yaxis: {
+                      title: 'mL',
+                      titlefont: { size: isMobile ? 10 : 12 },
+                      range: [0, 1000], // Fixed reasonable range for tidal volumes
+                      fixedrange: false,
+                      tickformat: '.0f' // Force integer display
+                    }
+                  }}
                   useResizeHandler={true}
                   style={{ width: '100%' }}
                   config={plotConfig}
                 />
+                {/* Debug info */}
+                <div className="text-xs opacity-50 mt-1">
+                  Max volume: {Math.max(...volume.y).toFixed(0)} mL | Target TV: {tidalVolume} mL
+                </div>
               </div>
 
               {/* Capnography */}
@@ -1282,6 +1578,11 @@ useEffect(() => {
                       <div className="mt-2 text-sm">
                         <strong>Hint:</strong> {currentQuiz.hint}
                       </div>
+                      {currentQuiz.isCorrect && currentQuiz.reference && (
+                        <div className="mt-2 text-sm opacity-90 border-t border-white/20 pt-2">
+                          <strong>📚 Reference:</strong> {currentQuiz.reference}
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
