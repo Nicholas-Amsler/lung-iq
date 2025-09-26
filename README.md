@@ -175,7 +175,7 @@ This simulator incorporates current evidence-based guidelines from leading medic
 - **Pediatrics**: Use **actual body weight** as lung development scales with overall growth
 - **Clinical Impact**: Using actual weight instead of IBW in adults can cause 15-40% overdose leading to VILI
 
-## 🔬 Recent Updates (January 2025)
+## 🔬 Recent Updates (July 2025)
 
 ### ✅ Enhanced Physiological Accuracy (Validated with 2024 Literature)
 - **Compliance-Based Calculations**: Tidal volume calculated using evidence-based compliance values
