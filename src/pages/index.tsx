@@ -114,7 +114,7 @@ export default function Home() {
   // ─── HELPER FUNCTIONS ──────────────────────────────────────────────────────
 
   // Get compliance values based on condition and patient type (from 2024 literature)
-  const getCompliance = (condition: string, patientType: string): number => {
+  const getCompliance = (condition: string, patientType: string, weight: number = 70): number => {
     // Adult values from 2024 studies
     if (patientType === 'adult') {
       switch (condition) {
@@ -129,7 +129,7 @@ export default function Home() {
     
     // Pediatric values adjusted for size
     const scaleFactor = Math.min(weight / 70, 1); // Scale based on weight
-    const baseCompliance = getCompliance(condition, 'adult');
+    const baseCompliance = getCompliance(condition, 'adult', weight);
     return Math.round(baseCompliance * scaleFactor * 0.8); // Pediatric adjustment
   };
 
@@ -202,7 +202,7 @@ export default function Home() {
   // Calculate tidal volume using proper compliance equation (2024 evidence-based)
   const calculateTidalVolume = (pip: number, peep: number, patientType: string, weight: number, condition: string) => {
     // Use compliance-based calculation: TV = Compliance × (PIP - PEEP)
-    const compliance = getCompliance(condition, patientType);
+    const compliance = getCompliance(condition, patientType, weight);
     const drivingPressure = pip - peep;
     const calculatedTV = Math.round(compliance * drivingPressure);
     
@@ -425,10 +425,10 @@ useEffect(() => {
     let y: number[];
 
     // Get actual compliance and resistance values from 2024 literature
-    const compliance = getCompliance(condition, 'adult'); // Will be scaled in TV calculation
+    const compliance = getCompliance(condition, 'adult', patientWeight); // Will be scaled in TV calculation
     const resistance = getResistance(condition);
     const timeConstant = getTimeConstant(condition);
-    const normalCompliance = getCompliance('normal', 'adult');
+    const normalCompliance = getCompliance('normal', 'adult', patientWeight);
     const normalResistance = getResistance('normal');
     
     // Calculate factors for waveform generation
@@ -547,7 +547,7 @@ useEffect(() => {
       }
       case 'volume': {
         // Calculate patient-specific tidal volume based on mode and compliance
-        const patientCompliance = getCompliance(condition, patientType);
+        const patientCompliance = getCompliance(condition, patientType, patientWeight);
         const drivingPressure = pip - peep;
         let targetTidalVolume = Math.round(patientCompliance * drivingPressure);
         
@@ -708,7 +708,7 @@ useEffect(() => {
   
   // Calculate compliance values for display
   const dynamicCompliance = pip > peep ? Math.round(tidalVolume / (pip - peep)) : 0;
-  const staticCompliance = getCompliance(condition, patientType);
+  const staticCompliance = getCompliance(condition, patientType, patientWeight);
   const drivingPressure = pip - peep;
 
   // Get current parameter ranges
