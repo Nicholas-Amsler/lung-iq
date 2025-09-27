@@ -85,6 +85,10 @@ export default function Home() {
   const [activeSection, setActiveSection] = useState<string>('controls');
   const [isMobile, setIsMobile] = useState<boolean>(false);
 
+  // ─── 6b. CLINICAL MODE STATE ───────────────────────────────────────────────
+  const [clinicalMode, setClinicalMode] = useState<boolean>(false);
+  const [targetTV, setTargetTV] = useState<number>(420); // Default 6 mL/kg for 70kg adult
+
   // ─── 7. KONAMI CODE EASTER EGG ─────────────────────────────────────────────
   // Classic cheat code: ↑↑↓↓←→←→BA - Unlocks all scenarios for development/testing
   const [konamiSequence, setKonamiSequence] = useState<string[]>([]);
@@ -115,15 +119,15 @@ export default function Home() {
 
   // Get compliance values based on condition and patient type (from 2024 literature)
   const getCompliance = (condition: string, patientType: string, weight: number = 70): number => {
-    // Adult values from 2024 studies
+    // Adult values from 2024 studies - TOTAL RESPIRATORY SYSTEM compliance (lung + chest wall)
     if (patientType === 'adult') {
       switch (condition) {
-        case 'ards': return 40; // 35-45 mL/cmH₂O range
-        case 'copd': return 59; // Higher compliance
-        case 'asthma': return 55; // Near normal compliance
-        case 'pneumothorax': return 30; // Severely reduced
-        case 'normal': return 54; // Normal adult compliance
-        default: return 50;
+        case 'ards': return 25; // 20-30 mL/cmH₂O range (severe reduction)
+        case 'copd': return 45; // Higher compliance due to emphysema
+        case 'asthma': return 35; // Reduced during exacerbation
+        case 'pneumothorax': return 20; // Severely reduced
+        case 'normal': return 35; // Normal total respiratory system compliance
+        default: return 35;
       }
     }
     
@@ -177,11 +181,15 @@ export default function Home() {
     const category = PEDIATRIC_CATEGORIES[patientType as keyof typeof PEDIATRIC_CATEGORIES];
     
     if (patientType === 'adult') {
+      // Calculate IBW for realistic TV ranges
+      const ibw = calculateIBW(patientHeight, patientGender);
+      
       return {
         peepRange: [3, 20],
         pipRange: [15, 50],
         rrRange: [8, 30],
-        tvRange: [400, 800],
+        // Adult TV range: 3-12 mL/kg IBW (wider range for clinical flexibility)
+        tvRange: [Math.round(ibw * 3), Math.round(ibw * 12)],
         ieRange: [0.25, 3.0]  // Extended to 0.25 for 1:4 reverse ratio
       };
     }
@@ -220,6 +228,29 @@ export default function Home() {
       const maxTV = Math.round(weight * category.tvPerKg[1]);
       return Math.max(minTV, Math.min(maxTV, calculatedTV));
     }
+  };
+
+  // Calculate required PIP for a target tidal volume (Clinical Mode)
+  const calculateRequiredPIP = (targetTV: number, peep: number, patientType: string, weight: number, condition: string) => {
+    // Get compliance for the condition
+    const compliance = getCompliance(condition, patientType, weight);
+    
+    // Calculate required driving pressure: DP = TV / Compliance
+    const requiredDrivingPressure = targetTV / compliance;
+    
+    // Calculate PIP: PIP = DP + PEEP
+    const calculatedPIP = Math.round(requiredDrivingPressure + peep);
+    
+    // Apply safety limits based on patient type
+    const maxSafePIP = patientType === 'adult' ? 40 : 30; // Lower limit for pediatrics
+    const warnPIP = patientType === 'adult' ? 35 : 25; // Warning threshold
+    
+    return {
+      pip: Math.min(calculatedPIP, maxSafePIP),
+      isLimited: calculatedPIP > maxSafePIP,
+      warning: calculatedPIP > warnPIP,
+      originalPIP: calculatedPIP
+    };
   };
 
   // Get age-appropriate respiratory rate
@@ -307,6 +338,31 @@ useEffect(() => {
       localStorage.setItem('lungIQ-konami', 'unlocked');
     }
   }, [konamiUnlocked]);
+
+  // Load Clinical Mode preference from localStorage
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const savedClinicalMode = localStorage.getItem('lungIQ-clinicalMode');
+      if (savedClinicalMode !== null) {
+        setClinicalMode(savedClinicalMode === 'true');
+      }
+    }
+  }, []);
+
+  // Save Clinical Mode preference to localStorage
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('lungIQ-clinicalMode', clinicalMode.toString());
+    }
+  }, [clinicalMode]);
+
+  // Sync PIP when in clinical mode and TV changes
+  useEffect(() => {
+    if (clinicalMode && mode === 'volume') {
+      const result = calculateRequiredPIP(targetTV, peep, patientType, patientWeight, condition);
+      setPip(result.pip);
+    }
+  }, [targetTV, peep, clinicalMode, mode, patientType, patientWeight, condition]);
 
   // Only read from localStorage on the client:
   useEffect(() => {
@@ -441,14 +497,30 @@ useEffect(() => {
       case 'pressure': {
         const riseTimeSteps = inspTime * riseTime;
         
-        // Calculate auto-PEEP for reverse I:E ratios
+        // Calculate realistic auto-PEEP for waveform display
         let autoPEEPLevel = 0;
-        if (ieRatio < 0.5) {
-          // With reverse I:E, incomplete expiration causes auto-PEEP
-          const expTime = breathLength - inspTime;
-          const timeNeeded = timeConstant * 3;
-          const incompleteness = Math.max(0, 1 - (expTime / timeNeeded));
-          autoPEEPLevel = incompleteness * 3; // Up to 3 cmH2O auto-PEEP
+        if (ieRatio < 0.5 || condition === 'copd' || condition === 'asthma') {
+          // Base auto-PEEP by condition
+          const baseAutoPEEP = {
+            'normal': 0.5,
+            'ards': 2,
+            'copd': 6,
+            'asthma': 8,
+            'pneumothorax': 1
+          }[condition] || 1;
+          
+          if (ieRatio < 0.5) {
+            // Reverse I:E significantly increases auto-PEEP
+            const expTime = breathLength - inspTime;
+            const timeNeeded = timeConstant * 3;
+            const incompleteness = Math.max(0, 1 - (expTime / timeNeeded));
+            autoPEEPLevel = baseAutoPEEP * (1 + incompleteness * 2); // Up to 3x base level
+          } else {
+            // Normal auto-PEEP for obstructive conditions
+            autoPEEPLevel = baseAutoPEEP * 0.7; // Moderate level
+          }
+          
+          autoPEEPLevel = Math.min(autoPEEPLevel, 20); // Cap at dangerous levels
         }
         
         y = cycle.map((i) => {
@@ -727,14 +799,47 @@ useEffect(() => {
   const minExpTime = timeConstant * 3; // Need 3 time constants for 95% emptying
   
   // Auto-PEEP present if flow doesn't return to zero, insufficient expiratory time, or reverse I:E
-  const autoPEEP = Math.abs(avgEndFlow) > 2 || expTime < minExpTime || ieRatio < 0.5;
+  const autoPEEP = Math.abs(avgEndFlow) > 0.1 || expTime < minExpTime || ieRatio < 0.5;
   
-  // Calculate estimated auto-PEEP level for display
-  const autoPEEPLevel = autoPEEP ? (
-    ieRatio < 0.5 ? 
-      Math.round(3 * (1 - ieRatio * 2)) : // Up to 3 cmH2O for reverse I:E
-      Math.round(2 * (1 - expTime / minExpTime)) // Up to 2 cmH2O for insufficient time
-  ) : 0;
+  // Calculate estimated auto-PEEP level for display - More realistic clinical values
+  const getAutoPEEPLevel = () => {
+    if (!autoPEEP) return 0;
+    
+    // Base auto-PEEP by condition (cmH₂O)
+    const baseAutoPEEP = {
+      'normal': 0.5,
+      'ards': 2,
+      'copd': 8,     // COPD can have significant auto-PEEP
+      'asthma': 12,  // Asthma exacerbation can be severe
+      'pneumothorax': 1
+    }[condition] || 1;
+    
+    // Severity multipliers
+    let severityMultiplier = 1;
+    
+    // Reverse I:E ratio contribution (more realistic)
+    if (ieRatio < 0.5) {
+      severityMultiplier += (0.5 - ieRatio) * 4; // Up to 2x multiplier for severe reverse I:E
+    }
+    
+    // Insufficient expiratory time contribution
+    if (expTime < minExpTime) {
+      const incompleteness = Math.max(0, 1 - (expTime / minExpTime));
+      severityMultiplier += incompleteness * 2; // Up to 2x multiplier
+    }
+    
+    // High respiratory rate contribution
+    if (rr > 20) {
+      severityMultiplier += (rr - 20) * 0.05; // 0.05x per breath above 20
+    }
+    
+    const calculatedAutoPEEP = baseAutoPEEP * severityMultiplier;
+    
+    // Cap at realistic maximum (25 cmH₂O would be life-threatening)
+    return Math.min(Math.round(calculatedAutoPEEP), 25);
+  };
+  
+  const autoPEEPLevel = getAutoPEEPLevel();
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -749,17 +854,35 @@ useEffect(() => {
   // ─── ALARM EFFECTS (keeping existing logic) ───────────────────────────────
   useEffect(() => {
     if (autoPEEP && !prevAutoPEEP.current) {
+      // Determine severity based on auto-PEEP level
+      let severity = 'info';
+      let message = `Auto-PEEP detected: ${autoPEEPLevel} cmH₂O`;
+      
+      if (autoPEEPLevel >= 15) {
+        severity = 'critical';
+        message += ' - DANGEROUS LEVEL! Risk of hemodynamic compromise';
+      } else if (autoPEEPLevel >= 8) {
+        severity = 'warning';
+        message += ' - Significant air trapping, consider reducing RR or extending expiration';
+      } else if (autoPEEPLevel >= 3) {
+        severity = 'warning';
+        message += ' - Moderate air trapping detected';
+      } else {
+        severity = 'info';
+        message += ' - Mild air trapping';
+      }
+      
       setAlarmLog((prev) => [
         ...prev,
         {
           time: new Date().toLocaleTimeString(),
-          alarm: 'Auto-PEEP suspected: Expiratory flow not returning to zero',
-          severity: 'warning',
+          alarm: message,
+          severity: severity,
         },
       ]);
     }
     prevAutoPEEP.current = autoPEEP;
-  }, [autoPEEP]);
+  }, [autoPEEP, autoPEEPLevel]);
 
   // ─── HIGH PRESSURE ALARM LOOP ──────────────────────────────────────────────
   useEffect(() => {
@@ -873,12 +996,28 @@ useEffect(() => {
   function loadScenario(scenario: Scenario) {
     // Load ventilator parameters
     setPeep(scenario.initialParams.peep);
-    setPip(scenario.initialParams.pip);
     setRR(scenario.initialParams.rr);
     setIERatio(scenario.initialParams.ieRatio);
     setRiseTime(scenario.initialParams.riseTime);
     setMode(scenario.initialParams.mode);
     setCondition(scenario.pathology);
+
+    // Handle PIP/TV based on clinical mode
+    if (scenario.initialParams.mode === 'volume' && clinicalMode) {
+      // In clinical mode, calculate TV from the scenario's PIP
+      const calculatedTV = calculateTidalVolume(
+        scenario.initialParams.pip,
+        scenario.initialParams.peep,
+        scenario.patientType || 'adult',
+        scenario.patientWeight || patientWeight,
+        scenario.pathology
+      );
+      setTargetTV(calculatedTV);
+      // PIP will be recalculated by the sync effect
+    } else {
+      // Normal mode - just set PIP
+      setPip(scenario.initialParams.pip);
+    }
 
     // Load patient demographics if specified
     if (scenario.patientType) {
@@ -889,6 +1028,12 @@ useEffect(() => {
     }
     if (scenario.patientAge) {
       setPatientAge(scenario.patientAge);
+    }
+    if (scenario.patientHeight) {
+      setPatientHeight(scenario.patientHeight);
+    }
+    if (scenario.patientGender) {
+      setPatientGender(scenario.patientGender);
     }
 
     // Clear previous session data
@@ -1006,6 +1151,9 @@ useEffect(() => {
         <div className="w-full flex flex-col sm:flex-row justify-between items-center mb-4 gap-2">
           <h1 className={`text-lg md:text-2xl font-bold ${labelText} text-center sm:text-left`}>
             Lung IQ: Clinical Waveform Simulator
+            {clinicalMode && mode === 'volume' && (
+              <span className="ml-2 text-sm font-normal text-blue-500">[Clinical Mode]</span>
+            )}
           </h1>
           <div className="flex gap-2">
             <button
@@ -1178,21 +1326,44 @@ useEffect(() => {
                 />
               </div>
 
-              {/* PIP Slider */}
-              <div className="space-y-2" id="pip-slider">
-                <div className="flex justify-between items-center">
-                  <span className={`${labelText} font-medium`}>PIP:</span>
-                  <span className={`${valueText} font-semibold`}>{pip} cmH₂O</span>
+              {/* PIP/TV Slider - Changes based on clinical mode */}
+              {mode === 'volume' && clinicalMode ? (
+                // Clinical Mode: TV Control
+                <div className="space-y-2" id="tv-slider">
+                  <div className="flex justify-between items-center">
+                    <span className={`${labelText} font-medium`}>Tidal Volume:</span>
+                    <span className={`${valueText} font-semibold`}>{targetTV} mL</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={parameterRanges.tvRange[0]}
+                    max={parameterRanges.tvRange[1]}
+                    value={targetTV}
+                    onChange={(e) => setTargetTV(Number(e.target.value))}
+                    className={`w-full h-8 ${isMobile ? 'h-12' : ''} appearance-none bg-gray-300 rounded-lg cursor-pointer`}
+                  />
+                  <div className="text-sm opacity-70">
+                    Resulting PIP: {pip} cmH₂O
+                    {pip > 35 && <span className="text-orange-400 ml-2">⚠️ High pressure!</span>}
+                  </div>
                 </div>
-                <input
-                  type="range"
-                  min={parameterRanges.pipRange[0]}
-                  max={parameterRanges.pipRange[1]}
-                  value={pip}
-                  onChange={(e) => setPip(Number(e.target.value))}
-                  className={`w-full h-8 ${isMobile ? 'h-12' : ''} appearance-none bg-gray-300 rounded-lg cursor-pointer`}
-                />
-              </div>
+              ) : (
+                // Educational Mode: PIP Control (default)
+                <div className="space-y-2" id="pip-slider">
+                  <div className="flex justify-between items-center">
+                    <span className={`${labelText} font-medium`}>PIP:</span>
+                    <span className={`${valueText} font-semibold`}>{pip} cmH₂O</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={parameterRanges.pipRange[0]}
+                    max={parameterRanges.pipRange[1]}
+                    value={pip}
+                    onChange={(e) => setPip(Number(e.target.value))}
+                    className={`w-full h-8 ${isMobile ? 'h-12' : ''} appearance-none bg-gray-300 rounded-lg cursor-pointer`}
+                  />
+                </div>
+              )}
 
               {/* RR Slider */}
               <div className="space-y-2">
@@ -1282,6 +1453,20 @@ useEffect(() => {
                   <option value="support">Pressure Support</option>
                 </select>
               </div>
+
+              {/* Clinical Mode Toggle - Only show for volume control */}
+              {mode === 'volume' && (
+                <div>
+                  <label className={`block ${labelText} font-medium mb-2`}>Clinical Mode:</label>
+                  <button
+                    onClick={() => setClinicalMode(!clinicalMode)}
+                    className={`w-full px-3 py-3 rounded border ${inputBg} ${isMobile ? 'text-lg' : ''} font-medium flex items-center justify-between`}
+                  >
+                    <span>{clinicalMode ? '✓ Enabled' : '○ Disabled'}</span>
+                    <span className="text-sm opacity-70">{clinicalMode ? 'TV Control' : 'PIP Control'}</span>
+                  </button>
+                </div>
+              )}
 
               <div className="flex items-end">
                 <button
@@ -1407,7 +1592,7 @@ useEffect(() => {
                     yaxis: {
                       title: 'mL',
                       titlefont: { size: isMobile ? 10 : 12 },
-                      range: [0, 1000], // Fixed reasonable range for tidal volumes
+                      range: [0, Math.max(tidalVolume * 1.5, 50)], // Dynamic range with 50% padding, minimum 50mL
                       fixedrange: false,
                       tickformat: '.0f' // Force integer display
                     }
